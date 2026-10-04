@@ -1,0 +1,115 @@
+# Fork-local checks. Runs the same commands the upstream PR workflows run, so the
+# result here tells you what the pull request will see, without waiting for a
+# maintainer to approve workflows on a pull request from a fork.
+#
+# Dispatch it from this branch and point `ref` at whatever you want checked — the
+# workflow file has to live somewhere, but it can check any branch or SHA.
+#
+# Check only: it never commits or pushes, so it cannot create an unsigned commit
+# and cannot trip the upstream "require signed commits" rule.
+name: Fork Checks
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or SHA to check.'
+        required: true
+        type: string
+        default: 'pr/tray-latency-test'
+      clippy:
+        description: 'Also run Clippy on all targets with -D warnings (about 14 minutes).'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: 'fork-checks-${{ github.ref }}'
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  HUSKY: 0
+
+jobs:
+  rustfmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: install Rust stable and rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: run cargo fmt
+        run: cargo fmt --manifest-path ./src-tauri/Cargo.toml --all -- --check
+
+  frontend:
+    name: frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          run_install: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.21.0'
+          cache: 'pnpm'
+
+      - run: pnpm install --frozen-lockfile
+      - name: Run Prettier check
+        run: pnpm format:check
+      - name: Run ESLint
+        run: pnpm lint
+      - name: Run TypeScript typecheck
+        run: pnpm typecheck
+      - name: Run tests
+        run: pnpm test
+      - name: Run Knip
+        run: pnpm knip:check
+
+  clippy:
+    name: clippy
+    if: ${{ inputs.clippy }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install Rust Stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxslt1.1 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: 'v1-rust'
+          key: 'rust-shared-stable-${{ runner.os }}-x86_64-unknown-linux-gnu'
+          workspaces: |
+            . -> target
+          cache-all-crates: true
+          cache-workspace-crates: true
+
+      - name: Run Clippy
+        working-directory: ./src-tauri
+        run: cargo clippy-all
