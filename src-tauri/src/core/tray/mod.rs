@@ -14,7 +14,7 @@ use crate::{
 use clash_verge_limiter::{Limiter, SystemClock, SystemLimiter};
 use clash_verge_logging::logging_error;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri_plugin_mihomo::models::Proxies;
+use tauri_plugin_mihomo::models::{Proxies, Proxy};
 use tokio::fs;
 
 use super::handle;
@@ -457,11 +457,40 @@ fn create_profile_menu_item(
         .collect()
 }
 
+const UNTESTED_DELAY_TEXT: &str = "-ms";
+const TIMEOUT_DELAY_TEXT: &str = "T/O";
+const TRAY_GROUP_DEPTH_LIMIT: usize = 8;
+
+fn selected_member_delay(
+    proxies: &HashMap<std::string::String, Proxy>,
+    delays: &HashMap<std::string::String, u16>,
+    name: &str,
+) -> Option<u16> {
+    let mut current = name.to_owned();
+    for _ in 0..TRAY_GROUP_DEPTH_LIMIT {
+        let next = proxies
+            .get(&current)
+            .filter(|proxy| proxy.all.is_some())
+            .and_then(|group| group.now.clone())
+            .filter(|now| !now.is_empty() && now.as_str() != current.as_str());
+        let Some(next) = next else { break };
+        current = next;
+    }
+    delays.get(&current).copied().or_else(|| {
+        proxies
+            .get(name)
+            .and_then(|proxy| proxy.history.last())
+            .map(|history| history.delay)
+    })
+}
+
 fn create_subcreate_proxy_menu_item(
     app_handle: &AppHandle,
     proxy_mode: &str,
     proxy_group_order_map: Option<HashMap<String, usize>>,
     proxy_nodes_data: Option<Proxies>,
+    delay_lookup: &HashMap<std::string::String, u16>,
+    latency_timeout: u16,
 ) -> Vec<Submenu<Wry>> {
     let proxy_submenus: Vec<Submenu<Wry>> = {
         let mut submenus: Vec<(String, usize, Submenu<Wry>)> = Vec::new();
@@ -490,16 +519,16 @@ fn create_subcreate_proxy_menu_item(
                         let is_selected = *proxy_str == now_proxy;
                         let item_id = format!("proxy_{}_{}", group_name, proxy_str);
 
-                        let delay_text = proxy_nodes_data
-                            .proxies
-                            .get(proxy_str)
-                            .and_then(|h| h.history.last())
-                            .map(|h| match h.delay {
-                                0 => "-ms".into(),
-                                delay if delay >= 10000 => "-ms".into(),
-                                _ => format!("{}ms", h.delay),
-                            })
-                            .unwrap_or_else(|| "-ms".into());
+                        let delay_text = delay_lookup.get(proxy_str).map_or_else(
+                            || UNTESTED_DELAY_TEXT.to_owned(),
+                            |&delay| {
+                                if delay == 0 || delay >= latency_timeout {
+                                    TIMEOUT_DELAY_TEXT.to_owned()
+                                } else {
+                                    format!("{delay}ms")
+                                }
+                            },
+                        );
 
                         let display_text = format!("{}   | {}", proxy_str, delay_text);
 
@@ -601,11 +630,14 @@ async fn create_tray_menu(
         options.include_proxy_groups && verge_settings.tray_proxy_groups_display_mode.as_deref() != Some("disable");
 
     // TODO: should update tray menu again when it was timeout error
-    let (proxy_nodes_data, runtime_proxy_groups_order) = if fetch_proxy_groups {
-        let proxy_nodes_data =
-            tokio::time::timeout(Duration::from_millis(1000), handle::Handle::mihomo().get_proxies())
-                .await
-                .map_or(None, |res| res.ok());
+    let (proxy_nodes_data, proxy_providers_data, runtime_proxy_groups_order) = if fetch_proxy_groups {
+        let mihomo = handle::Handle::mihomo();
+        let (proxy_nodes_data, proxy_providers_data) = tokio::join!(
+            tokio::time::timeout(Duration::from_millis(1000), mihomo.get_proxies()),
+            mihomo.get_proxy_providers(),
+        );
+        let proxy_nodes_data = proxy_nodes_data.map_or(None, |res| res.ok());
+        let proxy_providers_data = proxy_providers_data.ok();
 
         let runtime = Config::runtime().await.latest_arc();
         let runtime_proxy_groups_order = runtime.config.as_ref().map(|config| {
@@ -624,9 +656,42 @@ async fn create_tray_menu(
                 .unwrap_or_default()
         });
 
-        (proxy_nodes_data, runtime_proxy_groups_order)
+        (proxy_nodes_data, proxy_providers_data, runtime_proxy_groups_order)
     } else {
-        (None, None)
+        (None, None, None)
+    };
+
+    let delay_lookup: HashMap<std::string::String, u16> = {
+        let mut node_delays = HashMap::new();
+        if let Some(proxies) = proxy_nodes_data.as_ref() {
+            for (name, proxy) in &proxies.proxies {
+                if proxy.all.is_none()
+                    && let Some(history) = proxy.history.last()
+                {
+                    node_delays.insert(name.clone(), history.delay);
+                }
+            }
+        }
+        if let Some(providers) = proxy_providers_data.as_ref() {
+            for provider in providers.providers.values() {
+                for proxy in &provider.proxies {
+                    if let Some(history) = proxy.history.last() {
+                        node_delays.entry(proxy.name.clone()).or_insert(history.delay);
+                    }
+                }
+            }
+        }
+
+        let mut delays = node_delays;
+        if let Some(proxies) = proxy_nodes_data.as_ref() {
+            for name in proxies.proxies.keys() {
+                let delay = selected_member_delay(&proxies.proxies, &delays, name);
+                if let Some(delay) = delay {
+                    delays.insert(name.clone(), delay);
+                }
+            }
+        }
+        delays
     };
 
     if fetch_proxy_groups {
@@ -640,6 +705,8 @@ async fn create_tray_menu(
     let include_proxy_groups = options.include_proxy_groups && tray_proxy_groups_display_mode != "disable";
 
     let proxy_group_order_map = runtime_proxy_groups_order;
+
+    let latency_timeout = verge_settings.default_latency_timeout.unwrap_or(10000).max(1) as u16;
 
     let show_outbound_modes_inline = verge_settings.tray_inline_outbound_modes.unwrap_or(false);
 
@@ -721,8 +788,14 @@ async fn create_tray_menu(
     )?;
 
     let (proxies_menu, inline_proxy_items) = if include_proxy_groups {
-        let proxy_sub_menus =
-            create_subcreate_proxy_menu_item(app_handle, current_proxy_mode, proxy_group_order_map, proxy_nodes_data);
+        let proxy_sub_menus = create_subcreate_proxy_menu_item(
+            app_handle,
+            current_proxy_mode,
+            proxy_group_order_map,
+            proxy_nodes_data,
+            &delay_lookup,
+            latency_timeout,
+        );
 
         match tray_proxy_groups_display_mode {
             "default" => create_proxy_menu_item(app_handle, false, proxy_sub_menus, &texts.proxies)?,
@@ -985,6 +1058,7 @@ fn on_menu_event(_: &AppHandle, event: MenuEvent) {
                 };
                 feat::toggle_proxy_profile(profile_index.into()).await;
             }
+
             id if id.starts_with("proxy_") => {
                 let rest = match id.strip_prefix("proxy_") {
                     Some(r) => r,
